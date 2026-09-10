@@ -127,25 +127,69 @@ def grab_frame(dev, path):
     print("  saved %s (%dx%d gray)" % (path, W, H))
 
 
-def _autolevel(g8, lo_pct=1, hi_pct=99):
-    """Contrast-stretch a grayscale frame (float math, no integer banding) so
-    the (dark) correctly-converted 10-bit image is visible."""
+def _has_cuda():
+    import cv2
+    try:
+        return cv2.cuda.getCudaEnabledDeviceCount() > 0
+    except Exception:
+        return False
+
+
+_median_filter = None   # lazily-created cv2.cuda MedianFilter, reused across frames
+
+
+def _display_frame(g8):
+    """Contrast-stretch + median-blur + gray->BGR, ready for imshow/hconcat.
+
+    The correctly-converted 10-bit->8-bit frame is dark (the exposure only
+    spans part of the 10-bit range), hence the percentile stretch.
+
+    Runs on the GPU via cv2.cuda when available (percentile bounds come from
+    a 256-bin GPU histogram instead of downloading the full frame for
+    np.percentile; the stretch/median-blur/color-convert all run as GpuMat
+    ops and only the final small BGR frame is downloaded). Falls back to the
+    equivalent CPU/numpy path if no CUDA-enabled device is present.
+    """
     import numpy as np
-    lo, hi = np.percentile(g8, (lo_pct, hi_pct))
+    import cv2
+    if _has_cuda():
+        global _median_filter
+        gpu = cv2.cuda_GpuMat()
+        gpu.upload(g8)
+        hist = cv2.cuda.calcHist(gpu).download().ravel().astype(np.int64)
+        cdf = hist.cumsum()
+        total = cdf[-1] if cdf[-1] else 1
+        lo = float(np.searchsorted(cdf, total * 0.01))
+        hi = float(np.searchsorted(cdf, total * 0.99))
+        rng = max(hi - lo, 1.0)
+        alpha = 255.0 / rng
+        beta = -lo * alpha
+        stretched = gpu.convertTo(cv2.CV_8U, None, alpha, beta)
+        if _median_filter is None:
+            _median_filter = cv2.cuda.createMedianFilter(cv2.CV_8UC1, 3)
+        med = _median_filter.apply(stretched)
+        bgr = cv2.cuda.cvtColor(med, cv2.COLOR_GRAY2BGR)
+        return bgr.download()
+    lo, hi = np.percentile(g8, (1, 99))
     rng = max(float(hi) - float(lo), 1.0)
-    return np.clip(((g8.astype(np.float32) - lo) * 255.0 / rng),
-                   0, 255).astype(np.uint8)
+    stretched = np.clip((g8.astype(np.float32) - lo) * 255.0 / rng,
+                         0, 255).astype(np.uint8)
+    return cv2.cvtColor(cv2.medianBlur(stretched, 3), cv2.COLOR_GRAY2BGR)
 
 
-def run_live(cam_devs, fps, save_dir=None, duration=0.0):
-    """Live side-by-side preview of both cameras.
+def run_live(cam_devs, fps, save_dir=None, duration=0.0, labels=None):
+    """Live preview of whichever cameras are actually present (one or two).
 
     The raw Y10 is captured by the proven v4l2-ctl path into a FIFO (avoids the
-    GStreamer/cv2 grey_y10 gaps), converted to 8-bit gray (10-bit LSB -> >>2), and
-    shown side by side with cv2.imshow. Press 'q' (or wait duration) to stop.
+    GStreamer/cv2 grey_y10 gaps), converted to 8-bit gray (10-bit high byte ->
+    >>8), and shown with cv2.imshow -- side by side if two cameras produce
+    frames, single-pane if only one does (a camera with nothing wired to its
+    CSI port never opens successfully, so it never contributes a frame; the
+    display no longer waits on it). Press 'q' (or wait duration) to stop.
     """
     import threading, cv2, numpy as np
     frame_size = W * H * 2          # 1280*800*2 bytes per Y10 frame
+    labels = labels or {d: ("cam%d" % i) for i, d in enumerate(cam_devs)}
     latest = {}
     counts = {d: 0 for d in cam_devs}
     lock = threading.Lock()
@@ -199,8 +243,7 @@ def run_live(cam_devs, fps, save_dir=None, duration=0.0):
                         if save_dir:
                             saved += 1
                             if saved % 30 == 0:
-                                label = "cam0" if "/video1" in dev else "cam1"
-                                cv2.imwrite(os.path.join(save_dir, "%s_live.png" % label), g8)
+                                cv2.imwrite(os.path.join(save_dir, "%s_live.png" % labels[dev]), g8)
                         buf = buf[frame_size:]
                 elif p.poll() is not None:
                     # v4l2-ctl stopped (or never started): stop reading.
@@ -231,9 +274,25 @@ def run_live(cam_devs, fps, save_dir=None, duration=0.0):
         threads.append(t)
 
     def _cleanup():
+        # SIGTERM doesn't reliably stop v4l2-ctl while it's blocked writing
+        # into the FIFO (observed: it can survive terminate() and keep the
+        # camera device open, so a later run fails with "Device or resource
+        # busy" until someone finds and kills it by hand) -- escalate to
+        # SIGKILL if it doesn't exit promptly.
         for p in live_procs:
             try:
                 p.terminate()
+            except Exception:
+                pass
+        for p in live_procs:
+            try:
+                p.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    p.kill()
+                    p.wait(timeout=2)
+                except Exception:
+                    pass
             except Exception:
                 pass
         for t in threads:
@@ -244,7 +303,7 @@ def run_live(cam_devs, fps, save_dir=None, duration=0.0):
 
     import time
     t0 = time.time()
-    win = "OV9281 live view (CAM0 | CAM1) - press q to quit"
+    win = "OV9281 live view (%s) - press q to quit" % " | ".join(labels[d] for d in cam_devs)
     has_disp = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
     if not has_disp:
         # No display in this session: fall back to snapshot-only (still "live",
@@ -265,30 +324,32 @@ def run_live(cam_devs, fps, save_dir=None, duration=0.0):
         return
 
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(win, 1280, 400)
+    cv2.resizeWindow(win, 1280 * len(cam_devs), 400)
     print("Live view running. Press 'q' in the window (or wait) to stop.")
     last_report = time.time()
     last_counts = dict(counts)
     while True:
         with lock:
-            f0 = latest.get("/dev/video1")
-            f1 = latest.get("/dev/video0")
-            c0, c1 = counts["/dev/video1"], counts["/dev/video0"]
-        if f0 is not None and f1 is not None:
-            # Correctly-converted gray (high byte = 10-bit >> 2) is dark because
-            # the exposure uses only part of the 10-bit range, so show a
-            # percentile-stretched version (float math, no banding) after a
-            # light median blur.
-            d0 = cv2.cvtColor(cv2.medianBlur(_autolevel(f0), 3), cv2.COLOR_GRAY2BGR)
-            d1 = cv2.cvtColor(cv2.medianBlur(_autolevel(f1), 3), cv2.COLOR_GRAY2BGR)
-            cv2.imshow(win, cv2.hconcat([d0, d1]))
+            frames = [latest.get(d) for d in cam_devs]
+            cur_counts = dict(counts)
+        # Show whichever devices currently have a frame -- a camera with
+        # nothing wired to its CSI port never opens, so it never appears here
+        # and must not block the other camera's display (that used to require
+        # *all* devices to have a frame, so a single missing camera left the
+        # window permanently blank).
+        panes = [f for f in frames if f is not None]
+        if panes:
+            disp = [_display_frame(f) for f in panes]
+            cv2.imshow(win, cv2.hconcat(disp) if len(disp) > 1 else disp[0])
         now = time.time()
         if now - last_report > 2:
-            print("  frames so far: cam0=%d cam1=%d (%.0f/%.0f fps)" %
-                  (c0, c1, (c0 - last_counts["/dev/video1"]) / 2.0,
-                   (c1 - last_counts["/dev/video0"]) / 2.0), flush=True)
+            print("  frames so far: %s" %
+                  ", ".join("%s=%d (%.0f fps)" %
+                            (labels[d], cur_counts[d],
+                             (cur_counts[d] - last_counts[d]) / 2.0)
+                            for d in cam_devs), flush=True)
             last_report = now
-            last_counts = dict(counts)
+            last_counts = cur_counts
         k = cv2.waitKey(30)
         if k == ord("q") or (duration and time.time() - t0 > duration):
             break
@@ -311,8 +372,10 @@ def main():
                          "overhead to the run; off by default so the fps number "
                          "stays close to the true bare-capture rate)")
     ap.add_argument("--live", action="store_true",
-                    help="live side-by-side preview of both cameras (needs a "
-                         "display/run within the desktop session)")
+                    help="live preview of whichever camera(s) are present -- "
+                         "side by side if both CAM0/CAM1 are wired, single-pane "
+                         "if only one is (needs a display/run within the "
+                         "desktop session)")
     ap.add_argument("--live-save-dir", default=None,
                     help="with --live, also save a snapshot PNG per camera every "
                          "30 frames (handy when there is no display)")
@@ -321,10 +384,21 @@ def main():
     devs = {"/dev/video1": "CAM0(port0)", "/dev/video0": "CAM1(port2)"}
 
     if a.live:
-        # Live preview takes over; it reads from both cameras via FIFO and shows
-        # them side by side (or saves snapshots if no display).
+        # Only pass devices that actually exist: a camera with nothing wired
+        # to its CSI port never gets a /dev/videoN node at all, and run_live
+        # no longer waits on a device that will never produce a frame.
+        live_devs = [d for d in devs if os.path.exists(d)]
+        if not live_devs:
+            print("No /dev/video* OV9281 device found (check `v4l2-ctl --list-devices`).")
+            return
+        if len(live_devs) < len(devs):
+            missing = [d for d in devs if d not in live_devs]
+            print("Note: %s not present (nothing wired to that CSI port) -- "
+                  "showing %s only." % (", ".join(missing), ", ".join(live_devs)))
+        labels = {"/dev/video1": "cam0", "/dev/video0": "cam1"}
         duration = a.seconds if a.seconds else 0.0
-        run_live(list(devs.keys()), a.fps, save_dir=a.live_save_dir, duration=duration)
+        run_live(live_devs, a.fps, save_dir=a.live_save_dir, duration=duration,
+                 labels=labels)
         return
 
     # Bound the run: if --count not given, derive it from --seconds so each

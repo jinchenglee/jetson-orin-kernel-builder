@@ -1,13 +1,48 @@
-# OV9281 dual camera for the Seeed J4012 (Orin NX 16GB)
+# OV9281 dual camera bring-up (Seeed J4012 / Orin Nano Devkit)
 
 Guide to go from a **fresh clone** of this repo (branch `ov9281`) to a working
-**dual OV9281 1280x800 RAW10 @ 120fps** setup on a Seeed Studio reComputer
-J4012, plus the live measurement/view scripts.
+**dual OV9281 1280x800 RAW10 @ 120fps** setup, plus the live measurement/view
+scripts. Originally developed and verified on a Seeed Studio reComputer
+J4012 (Orin NX 16GB); the same mode table and control fixes have also been
+ported to the NVIDIA Orin Nano/NX Developer Kit's own CSI wiring — see
+"Board variants" below.
 
 The OV9281 support is entirely out-of-tree: the sensor module (`nv_ov9281.ko`)
 and a Device Tree overlay (`tegra234-p3767-camera-p3768-ov9281-dual-j401-800p10bit`)
 are built here. The kernel itself is the stock L4T/Orin kernel and is built with
 the repo's generic kernel scripts.
+
+---
+
+## Board variants
+
+The 800p/120fps mode table, register sequence, and gain/exposure fixes below
+are board-independent. The DT overlay's CSI wiring (`tegra_sinterface`,
+CSI/VI `port-index`, `lane_polarity`, `discontinuous_clk`) is NOT — it must
+match each carrier's actual physical routing, or CAM0/CAM1 will get zero CSI
+frames (see "Known traps" below). Two overlay+build-script pairs exist so
+far, both suffixed by board:
+
+- `build-ov9281-800p-j401.sh` + `tegra234-p3767-camera-p3768-ov9281-dual-j401-800p10bit.dts`
+  — Seeed Studio reComputer J4012 (Orin NX 16GB). CAM0 = `serial_a`/port-index 0/
+  lane_polarity 6/`discontinuous_clk=yes`; CAM1 = `serial_c`/port-index 2/
+  lane_polarity 0/`discontinuous_clk=yes`.
+- `build-ov9281-800p-orinnano-devkit.sh` + `tegra234-p3767-camera-p3768-ov9281-dual-orinnano-devkit-800p10bit.dts`
+  — NVIDIA Orin Nano/NX Developer Kit (P3768 carrier + P3767 module). CAM0 =
+  `serial_b`/port-index 1/lane_polarity 6/`discontinuous_clk=no`; CAM1 =
+  `serial_c`/port-index 2/lane_polarity 1/`discontinuous_clk=yes` — taken from
+  this board's own stock jetson-io.py-generated "Camera OV9281 Dual" overlay,
+  NOT from the J401 file (its `serial_a`/port-index-0/polarity-0 CAM0 mapping
+  targets a different CSI PHY on this carrier).
+
+Porting to a third carrier: decompile that board's own working stock overlay
+(`dtc -I dtb -O dts your.dtbo`) if one exists, or derive routing from the
+vendor's factory device-tree/schematic (see the CAM0-routing story in "Known
+traps"), copy one of the two `.dts` files above, keep every wiring field from
+the new board's own source, and only carry over the mode-table/timing/control
+fields (`active_h`, `csi_pixel_bit_depth`, `line_length`, `pix_clk_hz`,
+`*_factor`, `*_gain_val`, `*_framerate`, `*_exp_time`) from this repo's 800p
+config. Add a matching board-suffixed build script.
 
 ---
 
@@ -72,14 +107,19 @@ must contain `nvidia-oot/drivers/media/i2c/nv_ov9281.c` AND
 
 ## Step 2 — build the overlay + module
 
+Pick the script matching your carrier (see "Board variants" above):
+
 ```bash
 cd scripts/ov9281
-bash build-ov9281-800p.sh
+bash build-ov9281-800p-j401.sh              # Seeed J4012
+# or
+bash build-ov9281-800p-orinnano-devkit.sh   # NVIDIA Orin Nano/NX Devkit
 ```
 
-That produces both, in `/tmp/ov9281-800p-prod-build/`:
+That produces both, in `/tmp/ov9281-800p-prod-build/` (J401 script) or
+`/tmp/ov9281-800p-orinnano-devkit-build/` (devkit script):
 
-- `tegra234-p3767-camera-p3768-ov9281-dual-j401-800p10bit.dtbo`
+- `tegra234-p3767-camera-p3768-ov9281-dual-<board>-800p10bit.dtbo`
 - `nvidia-oot/drivers/media/i2c/nv_ov9281.ko`
 
 The build applies (in order): the 800p mode table (`ov9281_mode_tbls_800p.h`),
@@ -133,13 +173,22 @@ Bare dual-capture benchmark:
 python3 measure-margin.py --seconds 10
 ```
 
-Live side-by-side view (needs a display session):
+Live view (needs a display session):
 
 ```bash
 # within the desktop session (DISPLAY set); else use --live-save-dir for PNGs
 python3 measure-margin.py --live
 python3 measure-margin.py --live --live-save-dir /tmp/liveout --seconds 5   # headless snapshots
 ```
+
+Shows both cameras side by side if both CAM0/CAM1 are wired, or a single pane
+if only one is (checks which `/dev/video*` nodes actually exist -- a camera
+with nothing wired to its CSI port never gets a device node and no longer
+blocks the other camera's display). The per-frame contrast stretch/median
+blur/color conversion runs on the GPU via `cv2.cuda` when the installed
+OpenCV has CUDA support (check with `python3 -c "import cv2;
+print(cv2.cuda.getCudaEnabledDeviceCount())"`), falling back to the
+equivalent CPU/numpy path otherwise.
 
 Runtime control override during a live/continuous stream (works and persists):
 
@@ -169,23 +218,44 @@ v4l2-ctl -d /dev/video1 --set-ctrl=exposure=5000 --set-ctrl=gain=100
   receiver (FORCE_FE). frame_rate stays a runtime-only control.
 - Init defaults: `default_gain=16` (1x), `default_exp_time=4000us` (~52% of the
   8.33 ms frame), `default_framerate=120000000`.
+- **CAM0 CSI silence is usually a wiring/port-index bug, not hardware.** On
+  J401, CAM0 produced zero CSI bytes forever (`uncorr_err`/timeout) while CAM1
+  worked, even with I2C probe/bind succeeding — looked exactly like a dead
+  sensor or bad cable. Root cause: the overlay's CAM0 had the right
+  `tegra_sinterface` (`serial_a`) but a leftover CSI/VI `port-index` (1) and
+  `lane_polarity` (0) that belonged to a different physical routing. Fixed by
+  changing only the three CAM0 `port-index` occurrences (endpoint in
+  `tegra-capture-vi`, `nvcsi` channel endpoint, and the sensor node's own
+  `ports/port@0/endpoint`) to match the carrier's actual factory routing
+  (extracted from Seeed's own IMX219 dual-camera overlay), while leaving
+  `lane_polarity` at the value that pairing implies. If CAM0 (or any single
+  channel) goes silent while the other channel on the same overlay works,
+  check `port-index`/`lane_polarity` consistency for that channel's
+  `tegra_sinterface` before suspecting the sensor, cable, or carrier hardware.
+  This is a different failure signature from `corr_err`/FORCE_FE (see above),
+  which is a `pix_clk_hz`/`line_length` math error, not a routing error.
 
 ---
 
 ## Layout of `scripts/ov9281/`
 
-- `build-ov9281-800p.sh` — builds the DT overlay + sensor module (use this).
-- `tegra234-p3767-camera-p3768-ov9281-dual-j401-800p10bit.dts` — committed
-  overlay source (self-contained; recompile with `dtc -@`).
+- `build-ov9281-800p-j401.sh` / `build-ov9281-800p-orinnano-devkit.sh` —
+  builds the DT overlay + sensor module for the named carrier (see "Board
+  variants" above).
+- `tegra234-p3767-camera-p3768-ov9281-dual-j401-800p10bit.dts` /
+  `tegra234-p3767-camera-p3768-ov9281-dual-orinnano-devkit-800p10bit.dts` —
+  committed overlay sources, one per carrier (self-contained; recompile with
+  `dtc -@`).
 - `ov9281_mode_tbls_800p.h` — the 1280x800@120fps sensor register table
-  (ported from the mainline/RPi ov9281 driver).
-- `controls.patch`, `fix-gain-exposure.patch` — control fixes applied at build.
+  (ported from the mainline/RPi ov9281 driver); shared by both carriers.
+- `controls.patch`, `fix-gain-exposure.patch` — control fixes applied at
+  build; shared by both carriers.
 - `measure-margin.py` — dual-capture benchmark + live view.
 - `set-max-perf.sh` / `restore-max-perf.sh` — lock clocks to max for a
   worst-case margin baseline (fan stays adaptive under `nvfancontrol`).
 - `build-j401-720p120.sh` / `build-j401-*` (imx219, routing) — earlier/other
-  variants, kept for reference. Use `build-ov9281-800p.sh` for the OV9281 800p
-  config.
+  J401 experiments, kept for reference. Use the board-specific 800p scripts
+  above for the current config.
 - `docs/ov9281/` — detailed bring-up / controls / 120fps notes.
 
 See `docs/ov9281/OV9281_120FPS_NOTES.md` and `OV9281_HANDOVER.md` (two levels up
