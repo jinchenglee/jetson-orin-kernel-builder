@@ -228,7 +228,7 @@
 +								max_exp_time = "499000";
  								step_exp_time = "1";
 -								default_exp_time = "1000"; /* lines, ~9.6ms */
-+								default_exp_time = "10000";
++								default_exp_time = "4000";
  
  								embedded_metadata_height = "0";
  							};
@@ -261,7 +261,7 @@
 +								max_exp_time = "499000";
  								step_exp_time = "1";
 -								default_exp_time = "1000"; /* lines, ~9.6ms */
-+								default_exp_time = "10000";
++								default_exp_time = "4000";
  
  								embedded_metadata_height = "0";
  							};
