@@ -154,6 +154,29 @@ reach the sensor and persist across streams). `DEFAULT_FRAME_LENGTH` is set to
 
 ## Step 3 — install and reboot
 
+Use the installer matching your carrier:
+
+```bash
+sudo bash install-ov9281-800p-j401.sh              # Seeed J4012
+# or
+sudo bash install-ov9281-800p-orinnano-devkit.sh   # NVIDIA Orin Nano/NX Devkit
+
+sudo /sbin/reboot
+```
+
+Each one installs the module (plus `depmod`) and the overlay, then repoints
+only the DEFAULT boot entry's `OVERLAYS` line at the new overlay — every
+other `LABEL` block is left alone as a reboot fallback. Both back up the
+previous module and `extlinux.conf` to `/boot/ov9281-before-800p-*.XXXXXX/`
+with a `restore.sh` next to them, and neither reboots for you. If anything
+fails partway they roll back automatically. Pass a build directory as `$1` if
+you did not build to the default location.
+
+The DT overlay change needs a reboot; the module change can be applied without
+one (`sudo /sbin/rmmod nv_ov9281 && sudo /sbin/modprobe nv_ov9281`).
+
+To do it by hand instead:
+
 ```bash
 MOD=/lib/modules/$(uname -r)/updates/drivers/media/i2c/nv_ov9281.ko
 sudo /usr/bin/install -m 644 \
@@ -166,9 +189,6 @@ sudo /usr/bin/install -m 644 \
 # ensure extlinux OVERLAYS points at the 800p10bit overlay, then reboot
 sudo /sbin/reboot
 ```
-
-The DT overlay change needs a reboot; the module change can be applied without
-one (`sudo /sbin/rmmod nv_ov9281 && sudo /sbin/modprobe nv_ov9281`).
 
 ---
 
@@ -273,6 +293,9 @@ v4l2-ctl -d /dev/video1 --set-ctrl=exposure=5000 --set-ctrl=gain=100
 - `build-ov9281-800p-j401.sh` / `build-ov9281-800p-orinnano-devkit.sh` —
   builds the DT overlay + sensor module for the named carrier (see "Board
   variants" above).
+- `install-ov9281-800p-j401.sh` / `install-ov9281-800p-orinnano-devkit.sh` —
+  installs what the matching build script produced, with backups + rollback
+  and a DEFAULT-boot-entry-only extlinux edit (see Step 3).
 - `tegra234-p3767-camera-p3768-ov9281-dual-j401-800p10bit.dts` /
   `tegra234-p3767-camera-p3768-ov9281-dual-orinnano-devkit-800p10bit.dts` —
   committed overlay sources, one per carrier (self-contained; recompile with
