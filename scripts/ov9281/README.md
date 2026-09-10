@@ -307,6 +307,12 @@ v4l2-ctl -d /dev/video1 --set-ctrl=exposure=5000 --set-ctrl=gain=100
 - `measure-margin.py` — dual-capture benchmark + live view.
 - `set-max-perf.sh` / `restore-max-perf.sh` — lock clocks to max for a
   worst-case margin baseline (fan stays adaptive under `nvfancontrol`).
+  Selects the `MAXN*` power mode **by name** rather than by ID, saves and
+  restores the mode as well as the clocks, and additionally pins the
+  fixed-function engines (DLA/PVA/NVENC/NVDEC/NVJPG/VIC/OFA) that
+  `jetson_clocks` does not cover, skipping whichever the board lacks. State
+  goes to `/etc/j401_perf_state` so it survives a reboot. Also used by the
+  TinyTag benchmarks in the sibling `tinytag_orin` repo.
 - `build-j401-720p120.sh` / `build-j401-*` (imx219, routing) — earlier/other
   J401 experiments, kept for reference. Use the board-specific 800p scripts
   above for the current config.
