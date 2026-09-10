@@ -257,10 +257,10 @@
 								num_lanes = "2";
 								tegra_sinterface = "serial_c";
 								phy_mode = "DPHY";
-								discontinuous_clk = "yes";
+								discontinuous_clk = "no";
 								dpcm_enable = "false";
 								cil_settletime = "0";
-								lane_polarity = "1";
+								lane_polarity = "0";
 								active_w = "1280";
 								active_h = "800";
 								mode_type = "grey";

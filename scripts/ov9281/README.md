@@ -30,10 +30,29 @@ far, both suffixed by board:
 - `build-ov9281-800p-orinnano-devkit.sh` + `tegra234-p3767-camera-p3768-ov9281-dual-orinnano-devkit-800p10bit.dts`
   — NVIDIA Orin Nano/NX Developer Kit (P3768 carrier + P3767 module). CAM0 =
   `serial_b`/port-index 1/lane_polarity 6/`discontinuous_clk=no`; CAM1 =
-  `serial_c`/port-index 2/lane_polarity 1/`discontinuous_clk=yes` — taken from
-  this board's own stock jetson-io.py-generated "Camera OV9281 Dual" overlay,
-  NOT from the J401 file (its `serial_a`/port-index-0/polarity-0 CAM0 mapping
-  targets a different CSI PHY on this carrier).
+  `serial_c`/port-index 2/lane_polarity 0/`discontinuous_clk=no`. Both
+  verified at 120.63 fps with 0 CSI errors. The `serial_b`/port-index values
+  come from this board's own stock jetson-io.py-generated "Camera OV9281
+  Dual" overlay, NOT from the J401 file (its `serial_a`/port-index-0 CAM0
+  mapping targets a different CSI PHY on this carrier) — but see the
+  `lane_polarity` warning below before trusting that stock overlay wholesale.
+
+**Do not trust the stock OV9281 overlay's `serial_c` `lane_polarity`.** It
+ships as `1`; the correct value for this connector is `0`, and with `1` the
+CAM1 channel gets zero CSI frames (`uncorr_err` timeouts) while its I2C probe
+still succeeds perfectly. `lane_polarity` describes PCB trace routing (whether
+P/N are swapped on the connector), so it cannot legitimately vary by sensor —
+yet NVIDIA's own overlays for these same two connectors disagree:
+
+| stock overlay | `serial_b` | `serial_c` |
+|---|---|---|
+| `imx219-dual` | 6 | *(absent → 0)* |
+| `imx477-dual` | 6 | 0 |
+| `ov9281-dual` | 6 | **1** ← wrong |
+
+IMX219/IMX477 are the well-tested profiles on this devkit and both agree on 0
+(as does this repo's verified J401 overlay), so the OV9281 profile's `1` is a
+bug in a profile that was evidently never validated past the I2C probe.
 
 Porting to a third carrier: decompile that board's own working stock overlay
 (`dtc -I dtb -O dts your.dtbo`) if one exists, or derive routing from the
@@ -42,7 +61,10 @@ traps"), copy one of the two `.dts` files above, keep every wiring field from
 the new board's own source, and only carry over the mode-table/timing/control
 fields (`active_h`, `csi_pixel_bit_depth`, `line_length`, `pix_clk_hz`,
 `*_factor`, `*_gain_val`, `*_framerate`, `*_exp_time`) from this repo's 800p
-config. Add a matching board-suffixed build script.
+config. Add a matching board-suffixed build script. Cross-check every wiring
+field against two or three of that board's other stock camera overlays --
+routing fields must agree across all of them, and one that disagrees is a bug
+in the less-tested profile, not a sensor-specific value.
 
 ---
 
@@ -234,6 +256,15 @@ v4l2-ctl -d /dev/video1 --set-ctrl=exposure=5000 --set-ctrl=gain=100
   `tegra_sinterface` before suspecting the sensor, cable, or carrier hardware.
   This is a different failure signature from `corr_err`/FORCE_FE (see above),
   which is a `pix_clk_hz`/`line_length` math error, not a routing error.
+- The same class of bug bit the Orin Nano devkit's CAM1: the stock OV9281
+  overlay's `serial_c` `lane_polarity` is `1` where every other stock overlay
+  for that same connector says `0`. Same signature — clean I2C probe/bind,
+  zero frames, `uncorr_err` timeouts forever. See the `lane_polarity` table
+  under "Board variants". The general rule: a routing field that disagrees
+  across a board's stock overlays is a bug in the least-tested profile, and
+  the sensor-agnostic ones (IMX219/IMX477) are the trustworthy reference.
+  Move the camera between the two ports to isolate whether a fault follows
+  the camera (hardware) or stays with the DT slot (overlay bug).
 
 ---
 
